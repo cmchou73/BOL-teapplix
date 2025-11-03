@@ -1,15 +1,12 @@
-# app.py  —  Streamlit BOL 產生器
-# 特色：
-# 1) 機密用環境變數 / st.secrets，不寫死在程式
-# 2) 天數 1~7（預設 3）
-# 3) 先列出合單（OriginalTxnId），預設全選、可選倉庫；按下產出才寫 PDF
-# 4) 檔名：BOL_{OID}_{SKU8}_{WH2}_{SCAC}.pdf
-#
-# 參考來源：你提供的 APITOBOL_v6_merged_plus_lines.py（合單與欄位規則）。  # :contentReference[oaicite:1]{index=1}
+# app.py — Streamlit BOL 產生器（Sidebar 選天數、倉庫欄位緊跟選取、去掉收件人欄）
+# 仍保留：
+# - v6 合單 + v5 欄位完整
+# - Page_ttl、HU/Pkg 欄位與數量、NMFC/Class
+# - NumPkgs1、Weight1 規則
+# - 檔名：BOL_{OID}_{SKU8}_{WH2}_{SCAC}.pdf
 
 import os
 import io
-import json
 import zipfile
 from datetime import datetime, timedelta
 
@@ -19,12 +16,12 @@ import streamlit as st
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
-    from backports.zoneinfo import ZoneInfo  # py3.8
+    from backports.zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 
-APP_TITLE = "BOL 產生器（OriginalTxnId 合單）"
+APP_TITLE = "BOL 產生器"
 TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
@@ -46,14 +43,15 @@ def _get_secret(name, default=""):
 
 TEAPPLIX_TOKEN = _get_secret("TEAPPLIX_TOKEN", "")
 
+# 把 UI 用的倉庫代號改成「CA 91789」「NJ 08816」
 WAREHOUSES = {
-    "W1": {
+    "CA 91789": {
         "name": _get_secret("W1_NAME", "Festival Neo CA"),
         "addr": _get_secret("W1_ADDR", "5500 Mission Blvd"),
         "citystatezip": _get_secret("W1_CITYSTATEZIP", "Montclair, CA 91763"),
         "sid": _get_secret("W1_SID", "CA-001"),
     },
-    "W2": {
+    "NJ 08816": {
         "name": _get_secret("W2_NAME", "Festival Neo NJ"),
         "addr": _get_secret("W2_ADDR", "10 Main St"),
         "citystatezip": _get_secret("W2_CITYSTATEZIP", "East Brunswick, NJ 08816"),
@@ -216,13 +214,13 @@ def build_row_from_group(oid, group, wh_key: str):
     total_pkgs, total_lb = _sum_group_totals(group)
     bol_num = (od.get("Invoice") or "").strip() or (oid or "").strip()
 
-    WH = WAREHOUSES.get(wh_key, WAREHOUSES["W1"])
+    WH = WAREHOUSES.get(wh_key, list(WAREHOUSES.values())[0])
 
     row = {
         "BillName": BILL_NAME,
         "BillAddress": BILL_ADDRESS,
         "BillCityStateZip": BILL_CITYSTATEZIP,
-        "ToName": to.get("Name", ""),
+        "ToName": to.get("Name", ""),  # 仍保留欄位值，但 UI 不顯示
         "ToAddress": to_address,
         "ToCityStateZip": f"{to.get('City','')}, {to.get('State','')} {to.get('ZipCode','')}".strip().strip(", "),
         "ToCID": to.get("PhoneNumber", ""),
@@ -286,12 +284,12 @@ if not TEAPPLIX_TOKEN:
     st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
     st.stop()
 
-days = st.slider("抓單天數（1~7 天）", 1, 7, 3)
+# 天數放到左側 Sidebar，並改成下拉選單
+days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天（index=2）")
 
-col1, col2 = st.columns([1,1])
-with col1:
-    if st.button("抓取訂單", use_container_width=True):
-        st.session_state["orders_raw"] = fetch_orders(days)
+# 操作區
+if st.button("抓取訂單", use_container_width=True):
+    st.session_state["orders_raw"] = fetch_orders(days)
 
 orders_raw = st.session_state.get("orders_raw", None)
 
@@ -305,31 +303,34 @@ if orders_raw:
         to = first.get("To") or {}
         sku8 = _sku8_from_order(first)
         qty_sum = sum(_qty_from_order(o) for o in group)
+        # 調整欄位順序：Select -> Warehouse -> 其餘
         table_rows.append({
             "Select": True,
+            "Warehouse": "CA 91789",  # 預設
             "OriginalTxnId": oid,
             "SKU8": sku8,
             "SCAC": scac,
-            "ToName": to.get("Name",""),
             "ToCity": to.get("City",""),
             "ToState": to.get("State",""),
             "QtySum": qty_sum,
-            "Warehouse": "W1",
+            # 不再放 ToName（收件人）
         })
 
     st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
     edited = st.data_editor(
-        table_rows, num_rows="fixed", use_container_width=True, hide_index=True,
+        table_rows,
+        num_rows="fixed",
+        use_container_width=True,
+        hide_index=True,
         column_config={
             "Select": st.column_config.CheckboxColumn("選取", default=True),
-            "OriginalTxnId": st.column_config.TextColumn("OriginalTxnId"),
-            "SKU8": st.column_config.TextColumn("SKU(前8)"),
+            "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),
+            "OriginalTxnId": st.column_config.TextColumn("PO"),
+            "SKU8": st.column_config.TextColumn("SKU"),
             "SCAC": st.column_config.TextColumn("SCAC"),
-            "ToName": st.column_config.TextColumn("收件人"),
             "ToCity": st.column_config.TextColumn("城市"),
             "ToState": st.column_config.TextColumn("州"),
             "QtySum": st.column_config.NumberColumn("總數量"),
-            "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),
         },
         key="orders_table",
     )
@@ -343,11 +344,12 @@ if orders_raw:
             made_files = []
             for row_preview in selected:
                 oid = row_preview["OriginalTxnId"]
-                wh = row_preview["Warehouse"]
+                wh_key = row_preview["Warehouse"]
                 group = grouped.get(oid, [])
                 if not group:
                     continue
-                row_dict, WH = build_row_from_group(oid, group, wh)
+
+                row_dict, WH = build_row_from_group(oid, group, wh_key)
 
                 sku8 = row_preview["SKU8"] or (_sku8_from_order(group[0]) or "NOSKU")[:8]
                 wh2 = (WH["name"][:2].upper() if WH["name"] else "WH")
