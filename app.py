@@ -319,6 +319,17 @@ def fill_pdf(row: dict, out_path: str):
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+# ---------- 密碼驗證 ----------
+PASSWORD = st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", "")) # 可改預設密碼
+st.sidebar.subheader("🔐 驗證區")
+input_pwd = st.sidebar.text_input("請輸入密碼", type="password")
+
+if input_pwd != PASSWORD:
+    st.warning("請輸入正確密碼後才能使用。")
+    st.stop()
+# ---------- 密碼驗證 ----------
+
 st.title(APP_TITLE)
 
 # 解說欄位（顯示在標題下方）
