@@ -1,9 +1,9 @@
-# app.py — Streamlit BOL 產生器（隱藏總箱數與城市，新增訂單時間 mm/dd/yy hh:mm）
+# app.py — Streamlit BOL 產生器（解說區、批次修改倉庫、訂單時間僅日期、城市與總箱數不顯示）
 # 仍保留：
-# - v6 合單 + v5 欄位完整
-# - Page_ttl、HU/Pkg 欄位與數量、NMFC/Class
-# - NumPkgs1、Weight1 規則
-# - 檔名：BOL_{OID}_{SKU8}_{WH2}_{SCAC}.pdf
+#  - v6 合單 + v5 欄位完整
+#  - Page_ttl、HU/Pkg 欄位與數量、NMFC/Class
+#  - NumPkgs1、Weight1 規則
+#  - 檔名：BOL_{OID}_{SKU8}_{WH2}_{SCAC}.pdf
 
 import os
 import io
@@ -154,11 +154,10 @@ def set_widget_value(widget, name, value):
         st.warning(f"填欄位 {name} 失敗：{e}")
         return False
 
-# 訂單時間解析：盡量把各種格式轉為 Phoenix 時區，輸出 mm/dd/yy hh:mm
-def _parse_order_time_to_phoenix_str(first_order):
+# 訂單時間：只顯示日期（mm/dd/yy）
+def _parse_order_date_str(first_order):
     tz_phx = ZoneInfo("America/Phoenix")
     od = first_order.get("OrderDetails") or {}
-    # 可能的欄位
     candidates = [
         od.get("PaymentDate"),
         od.get("OrderDate"),
@@ -172,13 +171,10 @@ def _parse_order_time_to_phoenix_str(first_order):
     val = str(raw).strip()
 
     dt = None
-    # 常見 ISO：YYYY-MM-DDTHH:MM:SS[.sss][Z或偏移]
     try:
         if "T" in val:
-            # 先將 Z 轉為 +00:00，便於 fromisoformat
             dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
         else:
-            # 嘗試幾個常見格式
             for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
                 try:
                     dt = datetime.strptime(val, fmt)
@@ -189,18 +185,15 @@ def _parse_order_time_to_phoenix_str(first_order):
         dt = None
 
     if dt is None:
-        # 最後一搏：只取日期部分
         try:
             dt = datetime.fromisoformat(val[:19])
         except Exception:
             return ""
 
-    # 如果是 naive，就當作 Phoenix 本地時間
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=tz_phx)
-    # 轉 Phoenix
     dt_phx = dt.astimezone(tz_phx)
-    return dt_phx.strftime("%m/%d/%y %H:%M")
+    return dt_phx.strftime("%m/%d/%y")  # 僅日期
 
 # ---------- API ----------
 def fetch_orders(days: int):
@@ -268,7 +261,7 @@ def build_row_from_group(oid, group, wh_key: str):
         "BillName": BILL_NAME,
         "BillAddress": BILL_ADDRESS,
         "BillCityStateZip": BILL_CITYSTATEZIP,
-        "ToName": to.get("Name", ""),  # UI 不顯示，但 PDF 仍填
+        "ToName": to.get("Name", ""),
         "ToAddress": to_address,
         "ToCityStateZip": f"{to.get('City','')}, {to.get('State','')} {to.get('ZipCode','')}".strip().strip(", "),
         "ToCID": to.get("PhoneNumber", ""),
@@ -328,60 +321,98 @@ def fill_pdf(row: dict, out_path: str):
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
+# 解說欄位（顯示在標題下方）
+st.markdown("""
+**說明：**
+1. XXXX  
+2. BVBBVB  
+3. BBBB
+""")
+
 if not TEAPPLIX_TOKEN:
     st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
     st.stop()
 
-# 天數放到左側 Sidebar，下拉選單
+# 左側 Sidebar：天數下拉
 days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天（index=2）")
 
-# 操作區
+# 操作：抓單
 if st.button("抓取訂單", use_container_width=True):
     st.session_state["orders_raw"] = fetch_orders(days)
+    # 清掉之前的覆蓋資料
+    st.session_state.pop("table_rows_override", None)
 
 orders_raw = st.session_state.get("orders_raw", None)
 
 if orders_raw:
     grouped = group_by_original_txn(orders_raw)
-    table_rows = []
-    for oid, group in grouped.items():
-        first = group[0]
-        od = first.get("OrderDetails", {}) or {}
-        scac = (od.get("ShipClass") or "").strip()
-        sku8 = _sku8_from_order(first)
-        # 訂單時間（顯示 mm/dd/yy hh:mm）
-        order_time_str = _parse_order_time_to_phoenix_str(first)
 
-        # 表格欄位順序：Select -> Warehouse -> 其餘
-        # 注意：不顯示 ToCity、不顯示 總箱數 QtySum
-        table_rows.append({
-            "Select": True,
-            "Warehouse": "CA 91789",  # 預設
-            "OriginalTxnId": oid,
-            "SKU8": sku8,
-            "SCAC": scac,
-            "ToState": (first.get("To") or {}).get("State",""),
-            "OrderTime": order_time_str,  # 新增
-        })
+    # 準備表格資料
+    if "table_rows_override" in st.session_state:
+        table_rows = st.session_state["table_rows_override"]
+    else:
+        table_rows = []
+        for oid, group in grouped.items():
+            first = group[0]
+            od = first.get("OrderDetails", {}) or {}
+            scac = (od.get("ShipClass") or "").strip()
+            sku8 = _sku8_from_order(first)
+            order_date_str = _parse_order_date_str(first)  # 只日期
+            table_rows.append({
+                "Select": True,
+                "Warehouse": "CA 91789",  # 預設
+                "OriginalTxnId": oid,
+                "SKU8": sku8,
+                "SCAC": scac,
+                "ToState": (first.get("To") or {}).get("State",""),
+                "OrderDate": order_date_str,
+            })
 
     st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
+
+    # 批次修改倉庫（只改 Warehouse）
+    bulk_col1, bulk_col2, bulk_col3 = st.columns([1,1,6])
+    with bulk_col1:
+        bulk_wh = st.selectbox("批次指定倉庫", options=list(WAREHOUSES.keys()), index=0)
+    with bulk_col2:
+        apply_to = st.selectbox("套用對象", options=["勾選列", "全部"], index=0)
+    with bulk_col3:
+        if st.button("套用批次倉庫", use_container_width=True):
+            new_rows = []
+            if apply_to == "全部":
+                for r in table_rows:
+                    r2 = dict(r)
+                    r2["Warehouse"] = bulk_wh
+                    new_rows.append(r2)
+            else:  # 勾選列
+                for r in table_rows:
+                    r2 = dict(r)
+                    if r2.get("Select"):
+                        r2["Warehouse"] = bulk_wh
+                    new_rows.append(r2)
+            st.session_state["table_rows_override"] = new_rows
+            table_rows = new_rows
+            st.success("已套用批次倉庫變更。")
+
+    # 表格（僅允許編輯 Warehouse 與 Select；其他欄位鎖定）
     edited = st.data_editor(
         table_rows,
         num_rows="fixed",
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Select": st.column_config.CheckboxColumn("選取", default=True),
-            "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),
-            "OriginalTxnId": st.column_config.TextColumn("PO"),
-            "SKU8": st.column_config.TextColumn("SKU"),
-            "SCAC": st.column_config.TextColumn("SCAC"),
-            "ToState": st.column_config.TextColumn("州"),
-            "OrderTime": st.column_config.TextColumn("訂單時間 (mm/dd/yy hh:mm)"),
+            "Select": st.column_config.CheckboxColumn("選取", default=True),  # 可編輯
+            "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),  # 可編輯
+            "OriginalTxnId": st.column_config.TextColumn("PO", disabled=True),
+            "SKU8": st.column_config.TextColumn("SKU", disabled=True),
+            "SCAC": st.column_config.TextColumn("SCAC", disabled=True),
+            "ToState": st.column_config.TextColumn("州", disabled=True),
+            "OrderDate": st.column_config.TextColumn("訂單日期 (mm/dd/yy)", disabled=True),
         },
         key="orders_table",
     )
 
+    # 產出 BOL
     if st.button("產生 BOL（勾選列）", type="primary", use_container_width=True):
         selected = [r for r in edited if r.get("Select")]
         if not selected:
