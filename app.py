@@ -328,9 +328,9 @@ if orders_raw:
             "OriginalTxnId": st.column_config.TextColumn("PO"),
             "SKU8": st.column_config.TextColumn("SKU"),
             "SCAC": st.column_config.TextColumn("SCAC"),
-            "ToCity": st.column_config.TextColumn("城市"),
+            #"ToCity": st.column_config.TextColumn("城市"),
             "ToState": st.column_config.TextColumn("州"),
-            "QtySum": st.column_config.NumberColumn("總數量"),
+            "QtySum": st.column_config.NumberColumn("總箱數"),
         },
         key="orders_table",
     )
