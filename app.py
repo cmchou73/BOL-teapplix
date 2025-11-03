@@ -117,7 +117,7 @@ def _first_item(order):
 
 def _desc_value_from_order(order):
     sku = (_first_item(order).get("ItemSKU") or "")
-    return f"{sku}Electric Fireplace".strip()
+    return f"{sku}  (Electric Fireplace)".strip()
 
 def _sku8_from_order(order):
     sku = (_first_item(order).get("ItemSKU") or "")
@@ -297,6 +297,8 @@ def build_row_from_group(oid, group, wh_key: str):
             row[f"HU_QTY_{idx}"]   = str(qty) if qty else ""
             row[f"Pkg_QTY_{idx}"]  = str(qty) if qty else ""
             total_qty_sum += qty
+            row[f"NMFC{idx}"] = "69420"
+            row[f"Class{idx}"] = "125"
 
     row["NumPkgs1"] = str(total_qty_sum)
     row["Weight1"] = "130 lbs" if total_qty_sum <= 1 else f"{130 + (total_qty_sum - 1) * 30} lbs"
