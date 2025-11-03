@@ -1,14 +1,14 @@
-# app.py — Streamlit BOL 產生器
-# 變更：
-# - Sidebar 新增多筆 PO 搜尋：「搜尋HD PO(一行一個PO):」多行輸入 + 「查詢 PO」按鈕
-# - 搜尋包含：已出貨/未出貨、所有 ShipClass（含 UNSP_CG）
-# - 搜尋結果與日期抓單結果合併（OID 去重），沿用同一個表格與輸出流程
-# - 仍保留：只允許編輯「Select、Warehouse」、批次修改倉庫、訂單日期顯示 mm/dd/yy
+# app.py — Streamlit BOL 產生器（解說區、批次修改倉庫、訂單時間僅日期、城市與總箱數不顯示）
+# 仍保留：
+#  - v6 合單 + v5 欄位完整
+#  - Page_ttl、HU/Pkg 欄位與數量、NMFC/Class
+#  - NumPkgs1、Weight1 規則
+#  - 檔名：BOL_{OID}_{SKU8}_{WH2}_{SCAC}.pdf
 
 import os
 import io
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 import streamlit as st
@@ -21,11 +21,12 @@ except ImportError:
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 
-APP_TITLE = "Teapplix HD BOL 產生器"
+APP_TITLE = "Teapplix HD LTL BOL 產生器"
 TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
 STORE_KEY = "HD"
+SHIPPED   = "0"     # 0 = 未出貨
 PAGE_SIZE = 500
 
 CHECKBOX_FIELDS   = {"MasterBOL", "Term_Pre", "Term_Collect", "Term_CustChk", "FromFOB", "ToFOB"}
@@ -153,7 +154,7 @@ def set_widget_value(widget, name, value):
         st.warning(f"填欄位 {name} 失敗：{e}")
         return False
 
-# 訂單日期（只顯示日期 mm/dd/yy）
+# 訂單時間：只顯示日期（mm/dd/yy）
 def _parse_order_date_str(first_order):
     tz_phx = ZoneInfo("America/Phoenix")
     od = first_order.get("OrderDetails") or {}
@@ -192,10 +193,10 @@ def _parse_order_date_str(first_order):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=tz_phx)
     dt_phx = dt.astimezone(tz_phx)
-    return dt_phx.strftime("%m/%d/%y")
+    return dt_phx.strftime("%m/%d/%y")  # 僅日期
 
-# ---------- API：日期範圍抓單（未出貨、排除 UNSP_CG） ----------
-def fetch_orders_by_days(days: int):
+# ---------- API ----------
+def fetch_orders(days: int):
     ps, pe = phoenix_range_days(days)
     page = 1
     all_orders = []
@@ -203,7 +204,7 @@ def fetch_orders_by_days(days: int):
         params = {
             "PaymentDateStart": ps,
             "PaymentDateEnd": pe,
-            "Shipped": "0",  # 僅未出貨
+            "Shipped": SHIPPED,
             "StoreKey": STORE_KEY,
             "PageSize": str(PAGE_SIZE),
             "PageNumber": str(page),
@@ -212,12 +213,12 @@ def fetch_orders_by_days(days: int):
         }
         r = requests.get(BASE_URL, headers=get_headers(), params=params, timeout=45)
         if r.status_code != 200:
-            st.error(f"[抓單] API 錯誤: {r.status_code}\n{r.text}")
+            st.error(f"API 錯誤: {r.status_code}\n{r.text}")
             break
         try:
             data = r.json()
         except Exception:
-            st.error(f"[抓單] JSON 解析錯誤：{r.text[:1000]}")
+            st.error(f"JSON 解析錯誤：{r.text[:1000]}")
             break
 
         orders = data.get("orders") or data.get("Orders") or []
@@ -225,85 +226,12 @@ def fetch_orders_by_days(days: int):
 
         for o in orders:
             od = o.get("OrderDetails", {})
-            # 依你既有邏輯：排除 UNSP_CG
             if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
                 all_orders.append(o)
 
         if len(orders) < PAGE_SIZE: break
         page += 1
     return all_orders
-
-# ---------- API：以 OID 搜尋（含已出貨/未出貨、含所有 ShipClass） ----------
-def fetch_orders_by_oids(oids):
-    """對每個 OriginalTxnId 嘗試查詢；如果 API 不支援 OID 直查，就 fallback 近 90 天已/未出貨各抓一輪再 client 過濾。"""
-    results = []
-    oids = [o.strip() for o in oids if o.strip()]
-    if not oids:
-        return results
-
-    # 方案 A：假設 API 支援 OriginalTxnId 參數
-    for oid in oids:
-        ok = False
-        for shipped in ("0", "1"):  # 未出貨 / 已出貨 各查一輪
-            params = {
-                "StoreKey": STORE_KEY,
-                "Combine": "combine",
-                "DetailLevel": "shipping|inventory|marketplace",
-                "PageSize": "500",
-                "PageNumber": "1",
-                "Shipped": shipped,
-                "OriginalTxnId": oid,   # ★ 嘗試直查 OID
-            }
-            try:
-                r = requests.get(BASE_URL, headers=get_headers(), params=params, timeout=45)
-                if r.status_code == 200:
-                    data = r.json()
-                    orders = data.get("orders") or data.get("Orders") or []
-                    # 不過濾 ShipClass，UNSP_CG 也保留
-                    for o in orders:
-                        if (o.get("OriginalTxnId") or "").strip() == oid:
-                            results.append(o)
-                    ok = True
-                else:
-                    # 可能不支援 OID 參數，交給 B 方案
-                    ok = False
-                    break
-            except Exception:
-                ok = False
-                break
-        if not ok:
-            # 方案 B：90 天窗口 + 已/未出貨；client 端 OID 過濾
-            ps, pe = phoenix_range_days(90)
-            for shipped in ("0", "1"):
-                page = 1
-                while True:
-                    params = {
-                        "PaymentDateStart": ps,
-                        "PaymentDateEnd": pe,
-                        "Shipped": shipped,
-                        "StoreKey": STORE_KEY,
-                        "PageSize": str(PAGE_SIZE),
-                        "PageNumber": str(page),
-                        "Combine": "combine",
-                        "DetailLevel": "shipping|inventory|marketplace",
-                    }
-                    r = requests.get(BASE_URL, headers=get_headers(), params=params, timeout=45)
-                    if r.status_code != 200:
-                        break
-                    try:
-                        data = r.json()
-                    except Exception:
-                        break
-                    orders = data.get("orders") or data.get("Orders") or []
-                    if not orders:
-                        break
-                    for o in orders:
-                        if (o.get("OriginalTxnId") or "").strip() == oid:
-                            results.append(o)
-                    if len(orders) < PAGE_SIZE:
-                        break
-                    page += 1
-    return results
 
 # ---------- PDF 欄位建構 ----------
 def build_row_from_group(oid, group, wh_key: str):
@@ -393,7 +321,7 @@ def fill_pdf(row: dict, out_path: str):
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
 
-# 說明（沿用你上版）
+# 解說欄位（顯示在標題下方）
 st.markdown("""
 **說明：**
 1. 可能會錯, 請仔細核對
@@ -404,51 +332,31 @@ if not TEAPPLIX_TOKEN:
     st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
     st.stop()
 
-# Sidebar：天數 & PO 搜尋
-days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天")
-st.sidebar.markdown("**搜尋HD PO(一行一個PO):**")
-po_text = st.sidebar.text_area("在此貼上 OriginalTxnId（每行一個）", height=150, label_visibility="collapsed")
-if st.sidebar.button("查詢 PO"):
-    oids = list({line.strip() for line in po_text.splitlines() if line.strip()})
-    st.session_state["search_oids"] = oids
-    if oids:
-        st.session_state["orders_search_raw"] = fetch_orders_by_oids(oids)
-    else:
-        st.session_state["orders_search_raw"] = []
+# 左側 Sidebar：天數下拉
+days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天（index=2）")
 
-# 主操作：抓單
+# 操作：抓單
 if st.button("抓取訂單", use_container_width=True):
-    st.session_state["orders_days_raw"] = fetch_orders_by_days(days)
+    st.session_state["orders_raw"] = fetch_orders(days)
+    # 清掉之前的覆蓋資料
     st.session_state.pop("table_rows_override", None)
 
-orders_days_raw   = st.session_state.get("orders_days_raw", None)
-orders_search_raw = st.session_state.get("orders_search_raw", None)
+orders_raw = st.session_state.get("orders_raw", None)
 
-# 合併來源：日期抓單 + PO 搜尋（OID 去重）
-all_orders = []
-if orders_days_raw:
-    all_orders.extend(orders_days_raw)
-if orders_search_raw:
-    all_orders.extend(orders_search_raw)
-
-if all_orders:
-    grouped_all = group_by_original_txn(all_orders)
+if orders_raw:
+    grouped = group_by_original_txn(orders_raw)
 
     # 準備表格資料
     if "table_rows_override" in st.session_state:
         table_rows = st.session_state["table_rows_override"]
     else:
-        seen = set()
         table_rows = []
-        for oid, group in grouped_all.items():
-            if not oid or oid in seen:
-                continue
-            seen.add(oid)
+        for oid, group in grouped.items():
             first = group[0]
             od = first.get("OrderDetails", {}) or {}
             scac = (od.get("ShipClass") or "").strip()
             sku8 = _sku8_from_order(first)
-            order_date_str = _parse_order_date_str(first)  # mm/dd/yy
+            order_date_str = _parse_order_date_str(first)  # 只日期
             table_rows.append({
                 "Select": True,
                 "Warehouse": "CA 91789",  # 預設
@@ -459,9 +367,9 @@ if all_orders:
                 "OrderDate": order_date_str,
             })
 
-    st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併；含日期抓單 + PO 搜尋）")
+    st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
 
-    # 批次修改倉庫
+    # 批次修改倉庫（只改 Warehouse）
     bulk_col1, bulk_col2, bulk_col3 = st.columns([1,1,6])
     with bulk_col1:
         bulk_wh = st.selectbox("批次指定倉庫", options=list(WAREHOUSES.keys()), index=0)
@@ -472,8 +380,10 @@ if all_orders:
             new_rows = []
             if apply_to == "全部":
                 for r in table_rows:
-                    r2 = dict(r); r2["Warehouse"] = bulk_wh; new_rows.append(r2)
-            else:
+                    r2 = dict(r)
+                    r2["Warehouse"] = bulk_wh
+                    new_rows.append(r2)
+            else:  # 勾選列
                 for r in table_rows:
                     r2 = dict(r)
                     if r2.get("Select"):
@@ -483,15 +393,15 @@ if all_orders:
             table_rows = new_rows
             st.success("已套用批次倉庫變更。")
 
-    # 表格（僅允許 Select、Warehouse 可編輯）
+    # 表格（僅允許編輯 Warehouse 與 Select；其他欄位鎖定）
     edited = st.data_editor(
         table_rows,
         num_rows="fixed",
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Select": st.column_config.CheckboxColumn("選取", default=True),
-            "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),
+            "Select": st.column_config.CheckboxColumn("選取", default=True),  # 可編輯
+            "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),  # 可編輯
             "OriginalTxnId": st.column_config.TextColumn("PO", disabled=True),
             "SKU8": st.column_config.TextColumn("SKU", disabled=True),
             "SCAC": st.column_config.TextColumn("SCAC", disabled=True),
@@ -512,7 +422,7 @@ if all_orders:
             for row_preview in selected:
                 oid = row_preview["OriginalTxnId"]
                 wh_key = row_preview["Warehouse"]
-                group = grouped_all.get(oid, [])
+                group = grouped.get(oid, [])
                 if not group:
                     continue
 
@@ -544,4 +454,4 @@ if all_orders:
             else:
                 st.warning("沒有產生任何檔案。")
 else:
-    st.info("請先用左側輸入 PO（選擇性）或選天數後按『抓取訂單』。")
+    st.info("請先按『抓取訂單』。")
