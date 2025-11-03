@@ -21,7 +21,7 @@ except ImportError:
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 
-APP_TITLE = "BOL 產生器"
+APP_TITLE = "Teapplix HD BOL 產生器"
 TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
@@ -324,9 +324,8 @@ st.title(APP_TITLE)
 # 解說欄位（顯示在標題下方）
 st.markdown("""
 **說明：**
-1. XXXX  
-2. BVBBVB  
-3. BBBB
+1. 可能會錯, 請仔細核對 
+2. 只會抓取未發貨的HD LTL訂單
 """)
 
 if not TEAPPLIX_TOKEN:
