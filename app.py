@@ -1,4 +1,4 @@
-# app.py — Streamlit BOL 產生器（Sidebar 選天數、倉庫欄位緊跟選取、去掉收件人欄）
+# app.py — Streamlit BOL 產生器（隱藏總箱數與城市，新增訂單時間 mm/dd/yy hh:mm）
 # 仍保留：
 # - v6 合單 + v5 欄位完整
 # - Page_ttl、HU/Pkg 欄位與數量、NMFC/Class
@@ -8,7 +8,7 @@
 import os
 import io
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 import streamlit as st
@@ -43,7 +43,7 @@ def _get_secret(name, default=""):
 
 TEAPPLIX_TOKEN = _get_secret("TEAPPLIX_TOKEN", "")
 
-# 把 UI 用的倉庫代號改成「CA 91789」「NJ 08816」
+# UI 倉庫代號：「CA 91789」「NJ 08816」
 WAREHOUSES = {
     "CA 91789": {
         "name": _get_secret("W1_NAME", "Festival Neo CA"),
@@ -154,6 +154,54 @@ def set_widget_value(widget, name, value):
         st.warning(f"填欄位 {name} 失敗：{e}")
         return False
 
+# 訂單時間解析：盡量把各種格式轉為 Phoenix 時區，輸出 mm/dd/yy hh:mm
+def _parse_order_time_to_phoenix_str(first_order):
+    tz_phx = ZoneInfo("America/Phoenix")
+    od = first_order.get("OrderDetails") or {}
+    # 可能的欄位
+    candidates = [
+        od.get("PaymentDate"),
+        od.get("OrderDate"),
+        first_order.get("PaymentDate"),
+        first_order.get("Created"),
+        first_order.get("CreateDate"),
+    ]
+    raw = next((v for v in candidates if v), None)
+    if not raw:
+        return ""
+    val = str(raw).strip()
+
+    dt = None
+    # 常見 ISO：YYYY-MM-DDTHH:MM:SS[.sss][Z或偏移]
+    try:
+        if "T" in val:
+            # 先將 Z 轉為 +00:00，便於 fromisoformat
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+        else:
+            # 嘗試幾個常見格式
+            for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(val, fmt)
+                    break
+                except Exception:
+                    continue
+    except Exception:
+        dt = None
+
+    if dt is None:
+        # 最後一搏：只取日期部分
+        try:
+            dt = datetime.fromisoformat(val[:19])
+        except Exception:
+            return ""
+
+    # 如果是 naive，就當作 Phoenix 本地時間
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz_phx)
+    # 轉 Phoenix
+    dt_phx = dt.astimezone(tz_phx)
+    return dt_phx.strftime("%m/%d/%y %H:%M")
+
 # ---------- API ----------
 def fetch_orders(days: int):
     ps, pe = phoenix_range_days(days)
@@ -220,7 +268,7 @@ def build_row_from_group(oid, group, wh_key: str):
         "BillName": BILL_NAME,
         "BillAddress": BILL_ADDRESS,
         "BillCityStateZip": BILL_CITYSTATEZIP,
-        "ToName": to.get("Name", ""),  # 仍保留欄位值，但 UI 不顯示
+        "ToName": to.get("Name", ""),  # UI 不顯示，但 PDF 仍填
         "ToAddress": to_address,
         "ToCityStateZip": f"{to.get('City','')}, {to.get('State','')} {to.get('ZipCode','')}".strip().strip(", "),
         "ToCID": to.get("PhoneNumber", ""),
@@ -284,7 +332,7 @@ if not TEAPPLIX_TOKEN:
     st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
     st.stop()
 
-# 天數放到左側 Sidebar，並改成下拉選單
+# 天數放到左側 Sidebar，下拉選單
 days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天（index=2）")
 
 # 操作區
@@ -300,20 +348,20 @@ if orders_raw:
         first = group[0]
         od = first.get("OrderDetails", {}) or {}
         scac = (od.get("ShipClass") or "").strip()
-        to = first.get("To") or {}
         sku8 = _sku8_from_order(first)
-        qty_sum = sum(_qty_from_order(o) for o in group)
-        # 調整欄位順序：Select -> Warehouse -> 其餘
+        # 訂單時間（顯示 mm/dd/yy hh:mm）
+        order_time_str = _parse_order_time_to_phoenix_str(first)
+
+        # 表格欄位順序：Select -> Warehouse -> 其餘
+        # 注意：不顯示 ToCity、不顯示 總箱數 QtySum
         table_rows.append({
             "Select": True,
             "Warehouse": "CA 91789",  # 預設
             "OriginalTxnId": oid,
             "SKU8": sku8,
             "SCAC": scac,
-            "ToCity": to.get("City",""),
-            "ToState": to.get("State",""),
-            "QtySum": qty_sum,
-            # 不再放 ToName（收件人）
+            "ToState": (first.get("To") or {}).get("State",""),
+            "OrderTime": order_time_str,  # 新增
         })
 
     st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
@@ -328,9 +376,8 @@ if orders_raw:
             "OriginalTxnId": st.column_config.TextColumn("PO"),
             "SKU8": st.column_config.TextColumn("SKU"),
             "SCAC": st.column_config.TextColumn("SCAC"),
-            #"ToCity": st.column_config.TextColumn("城市"),
             "ToState": st.column_config.TextColumn("州"),
-            "QtySum": st.column_config.NumberColumn("總箱數"),
+            "OrderTime": st.column_config.TextColumn("訂單時間 (mm/dd/yy hh:mm)"),
         },
         key="orders_table",
     )
